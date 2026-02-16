@@ -5,6 +5,7 @@ import requests
 import json
 import hashlib
 import sys
+import time
 
 def get_authenticated_session(user, password):
     session = requests.Session()
@@ -54,6 +55,40 @@ def get_github_team_members(token, org, team_slug):
             
     return members
 
+def get_pending_invitations(token, org, team_slug):
+    """Fetch all pending invitations for a GitHub team."""
+    print(f"Fetching pending invitations for team: {team_slug}")
+    pending = set()
+    url = f"https://api.github.com/orgs/{org}/teams/{team_slug}/invitations"
+    headers = {
+        "Authorization": f"token {token}",
+        "Accept": "application/vnd.github.v3+json",
+    }
+
+    while url:
+        response = requests.get(url, headers=headers)
+        if response.status_code != 200:
+            print(f"Failed to fetch pending invitations: {response.status_code} {response.text}")
+            break
+
+        for invite in response.json():
+            login = invite.get("login")
+            if login:
+                pending.add(login.lower())
+
+        if "Link" in response.headers:
+            links = response.headers["Link"].split(",")
+            url = None
+            for link in links:
+                if 'rel="next"' in link:
+                    url = link.split(";")[0].strip("<> ")
+                    break
+        else:
+            url = None
+
+    print(f"Found {len(pending)} pending invitations.")
+    return pending
+
 def invite_to_github_team(token, org, team_slug, username):
     """Invite or add a user to a GitHub team."""
     url = f"https://api.github.com/orgs/{org}/teams/{team_slug}/memberships/{username}"
@@ -82,12 +117,22 @@ def fetch_groupsio_data(session, group_name):
     
     while True:
         url = f"https://groups.io/api/v1/getmembers?group_name={group_name}&page_token={next_page_token}"
-        try:
-            response = session.post(url)
-            response.raise_for_status()
-            data = response.json()
-        except Exception as e:
-            print(f"\nFailed to fetch Groups.io members: {e}")
+        data = None
+        for attempt in range(3):
+            try:
+                response = session.post(url)
+                if response.status_code != 200:
+                    print(f"\nAPI error {response.status_code}: {response.text}")
+                response.raise_for_status()
+                data = response.json()
+                break
+            except Exception as e:
+                if attempt < 2:
+                    print(f"\nRetry {attempt + 1}/3 after error: {e}")
+                    time.sleep(2 ** attempt)
+                else:
+                    print(f"\nFailed to fetch Groups.io members after 3 attempts: {e}")
+        if data is None:
             break
 
         members_list.extend(data.get("data", []))
@@ -97,31 +142,32 @@ def fetch_groupsio_data(session, group_name):
         next_page_token = data.get("next_page_token", 0)
         if next_page_token == 0:
             break
+        time.sleep(0.5)
             
     print(f"\nCompleted Groups.io fetch.")
     return members_list
 
-def sync_and_generate_data(members_list, gh_team_members, gh_token, org, team_slug):
+def sync_and_generate_data(members_list, gh_team_members, pending_invitations, gh_token, org, team_slug):
     """Sync Groups.io data with GitHub team and generate the UI mapping."""
     members_data = {}
     expected_gh_ids = set()
-    
+
     # Process Groups.io members
     for member in members_list:
         email = member.get("email", "").lower().strip()
         if not email:
             continue
-        
+
         github_id = ""
         if "extra_member_data" in member:
             for item in member["extra_member_data"]:
                 if item.get("col_id") == 2:
                     github_id = item.get("text", "").strip()
                     break
-        
+
         if github_id:
             expected_gh_ids.add(github_id.lower())
-        
+
         # Prepare data for static UI
         email_hash = hashlib.sha256(email.encode('utf-8')).hexdigest()
         members_data[email_hash] = {
@@ -130,17 +176,22 @@ def sync_and_generate_data(members_list, gh_team_members, gh_token, org, team_sl
         }
 
     print("\n--- Sync & Audit Report ---")
-    
-    # 1. INVITE NEW MEMBERS
+
+    # 1. INVITE NEW MEMBERS (skip already in team or pending invitation)
     invites_sent = 0
+    skipped_pending = 0
     print("New members to invite:")
     for gh_id in expected_gh_ids:
-        if gh_id not in gh_team_members:
-            if invite_to_github_team(gh_token, org, team_slug, gh_id):
-                invites_sent += 1
-                for h in members_data:
-                    if members_data[h]["github_id"].lower() == gh_id:
-                        members_data[h]["is_in_team"] = True
+        if gh_id in gh_team_members:
+            continue
+        if gh_id in pending_invitations:
+            skipped_pending += 1
+            continue
+        if invite_to_github_team(gh_token, org, team_slug, gh_id):
+            invites_sent += 1
+            for h in members_data:
+                if members_data[h]["github_id"].lower() == gh_id:
+                    members_data[h]["is_in_team"] = True
 
     # 2. LOG UNAUTHORIZED MEMBERS (AUDIT ONLY)
     unauthorized_members = []
@@ -156,6 +207,7 @@ def sync_and_generate_data(members_list, gh_team_members, gh_token, org, team_sl
     print(f"  Total Groups.io Members: {len(members_list)}")
     print(f"  Total GitHub IDs in Groups.io: {len(expected_gh_ids)}")
     print(f"  Total GitHub Team Members (before sync): {len(gh_team_members)}")
+    print(f"  Pending Invitations (skipped): {skipped_pending}")
     print(f"  New Invites Sent: {invites_sent}")
     print(f"  Unauthorized/Unlinked Members: {len(unauthorized_members)}")
     print("---------------------------\n")
@@ -175,10 +227,13 @@ def main():
         sys.exit(1)
 
     gh_team_members = get_github_team_members(gh_token, org, team_slug)
+    pending_invitations = get_pending_invitations(gh_token, org, team_slug)
     session = get_authenticated_session(user, password)
-    groupsio_members = fetch_groupsio_data(session, "risc-v")
     
-    members_data = sync_and_generate_data(groupsio_members, gh_team_members, gh_token, org, team_slug)
+    group_name = os.environ.get("GROUPSIO_GROUP", "risc-v")
+    groupsio_members = fetch_groupsio_data(session, group_name)
+
+    members_data = sync_and_generate_data(groupsio_members, gh_team_members, pending_invitations, gh_token, org, team_slug)
     
     os.makedirs("public", exist_ok=True)
     with open("public/data.json", "w") as f:
