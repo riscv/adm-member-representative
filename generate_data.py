@@ -6,6 +6,7 @@ import json
 import hashlib
 import sys
 import time
+from datetime import datetime, timezone
 
 def get_authenticated_session(user, password):
     session = requests.Session()
@@ -170,9 +171,11 @@ def sync_and_generate_data(members_list, gh_team_members, pending_invitations, g
 
         # Prepare data for static UI
         email_hash = hashlib.sha256(email.encode('utf-8')).hexdigest()
+        gh_id_lower = github_id.lower() if github_id else ""
         members_data[email_hash] = {
             "github_id": github_id,
-            "is_in_team": github_id.lower() in gh_team_members if github_id else False
+            "is_in_team": gh_id_lower in gh_team_members if github_id else False,
+            "invitation_sent": gh_id_lower in pending_invitations if github_id else False
         }
 
     print("\n--- Sync & Audit Report ---")
@@ -192,6 +195,7 @@ def sync_and_generate_data(members_list, gh_team_members, pending_invitations, g
             for h in members_data:
                 if members_data[h]["github_id"].lower() == gh_id:
                     members_data[h]["is_in_team"] = True
+                    members_data[h]["invitation_sent"] = True
 
     # 2. LOG UNAUTHORIZED MEMBERS (AUDIT ONLY)
     unauthorized_members = []
@@ -235,9 +239,14 @@ def main():
 
     members_data = sync_and_generate_data(groupsio_members, gh_team_members, pending_invitations, gh_token, org, team_slug)
     
+    output = {
+        "last_updated": datetime.now(timezone.utc).isoformat(),
+        "members": members_data
+    }
+
     os.makedirs("public", exist_ok=True)
     with open("public/data.json", "w") as f:
-        json.dump(members_data, f)
+        json.dump(output, f)
     
     print(f"Successfully generated data.json with {len(members_data)} entries.")
 
