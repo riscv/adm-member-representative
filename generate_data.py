@@ -56,15 +56,23 @@ def get_github_team_members(token, org, team_slug):
             
     return members
 
+INVITATION_EXPIRY_DAYS = 7
+
 def get_pending_invitations(token, org, team_slug):
-    """Fetch all pending invitations for a GitHub team."""
+    """Fetch all pending invitations for a GitHub team.
+
+    Returns a dict mapping lowercase username to invitation metadata:
+      {"id": <invitation_id>, "created_at": <ISO string>, "expired": <bool>}
+    An invitation is considered expired when it is >= INVITATION_EXPIRY_DAYS old.
+    """
     print(f"Fetching pending invitations for team: {team_slug}")
-    pending = set()
+    pending = {}
     url = f"https://api.github.com/orgs/{org}/teams/{team_slug}/invitations"
     headers = {
         "Authorization": f"token {token}",
         "Accept": "application/vnd.github.v3+json",
     }
+    now = datetime.now(timezone.utc)
 
     while url:
         response = requests.get(url, headers=headers)
@@ -74,8 +82,22 @@ def get_pending_invitations(token, org, team_slug):
 
         for invite in response.json():
             login = invite.get("login")
-            if login:
-                pending.add(login.lower())
+            if not login:
+                continue
+            created_at_str = invite.get("created_at", "")
+            invite_id = invite.get("id")
+            expired = False
+            if created_at_str:
+                try:
+                    created_at = datetime.fromisoformat(created_at_str.replace("Z", "+00:00"))
+                    expired = (now - created_at).days >= INVITATION_EXPIRY_DAYS
+                except ValueError:
+                    pass
+            pending[login.lower()] = {
+                "id": invite_id,
+                "created_at": created_at_str,
+                "expired": expired,
+            }
 
         if "Link" in response.headers:
             links = response.headers["Link"].split(",")
@@ -87,7 +109,8 @@ def get_pending_invitations(token, org, team_slug):
         else:
             url = None
 
-    print(f"Found {len(pending)} pending invitations.")
+    expired_count = sum(1 for v in pending.values() if v["expired"])
+    print(f"Found {len(pending)} pending invitations ({expired_count} expired).")
     return pending
 
 def invite_to_github_team(token, org, team_slug, username):
@@ -108,6 +131,29 @@ def invite_to_github_team(token, org, team_slug, username):
     except Exception as e:
         print(f"  [!] Error inviting {username}: {e}")
         return False
+
+def cancel_github_invitation(token, org, invitation_id, username):
+    """Cancel an expired GitHub org invitation so it can be re-sent."""
+    if not invitation_id:
+        print(f"  [!] No invitation ID available to cancel for {username}, skipping cancel step.")
+        return False
+    url = f"https://api.github.com/orgs/{org}/invitations/{invitation_id}"
+    headers = {
+        "Authorization": f"token {token}",
+        "Accept": "application/vnd.github.v3+json",
+    }
+    try:
+        response = requests.delete(url, headers=headers)
+        if response.status_code == 204:
+            print(f"  [~] Cancelled expired invitation for {username}")
+            return True
+        else:
+            print(f"  [!] Failed to cancel invitation for {username}: {response.status_code} {response.text}")
+            return False
+    except Exception as e:
+        print(f"  [!] Error cancelling invitation for {username}: {e}")
+        return False
+
 
 def fetch_groupsio_data(session, group_name):
     """Fetch all members from Groups.io and extract GitHub IDs."""
@@ -180,15 +226,26 @@ def sync_and_generate_data(members_list, gh_team_members, pending_invitations, g
 
     print("\n--- Sync & Audit Report ---")
 
-    # 1. INVITE NEW MEMBERS (skip already in team or pending invitation)
+    # 1. INVITE NEW MEMBERS (skip already in team or pending invitation; re-send expired)
     invites_sent = 0
     skipped_pending = 0
+    expired_resent = 0
     print("New members to invite:")
     for gh_id in expected_gh_ids:
         if gh_id in gh_team_members:
             continue
         if gh_id in pending_invitations:
-            skipped_pending += 1
+            invite_info = pending_invitations[gh_id]
+            if invite_info["expired"]:
+                print(f"  [~] Invitation for {gh_id} expired (sent {invite_info['created_at']}), re-sending...")
+                cancel_github_invitation(gh_token, org, invite_info["id"], gh_id)
+                if invite_to_github_team(gh_token, org, team_slug, gh_id):
+                    expired_resent += 1
+                    for h in members_data:
+                        if members_data[h]["github_id"].lower() == gh_id:
+                            members_data[h]["invitation_sent"] = True
+            else:
+                skipped_pending += 1
             continue
         if invite_to_github_team(gh_token, org, team_slug, gh_id):
             invites_sent += 1
@@ -212,6 +269,7 @@ def sync_and_generate_data(members_list, gh_team_members, pending_invitations, g
     print(f"  Total GitHub IDs in Groups.io: {len(expected_gh_ids)}")
     print(f"  Total GitHub Team Members (before sync): {len(gh_team_members)}")
     print(f"  Pending Invitations (skipped): {skipped_pending}")
+    print(f"  Expired Invitations Re-sent: {expired_resent}")
     print(f"  New Invites Sent: {invites_sent}")
     print(f"  Unauthorized/Unlinked Members: {len(unauthorized_members)}")
     print("---------------------------\n")
